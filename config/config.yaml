@@ -1,0 +1,22 @@
+# Project directory (all inputs/outputs relative to this)
+workdir: /vol/mgcourse/hg002
+sample: HG002
+threads: 24
+
+# Input: either a GIAB BAM URL (converted to FASTQ) or existing FASTQs
+input_bam_url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/OsloUniversityHospital_Exome/151002_7001448_0359_AC7F6GANXX_Sample_HG002-EEogPU_v02-KIT-Av5_AGATGTAC_L008.posiSrt.markDup.bam
+
+reference_url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/references/GRCh38/GCA_000001405.15_GRCh38_no_alt_analysis_set.fasta.gz
+truth_base_url: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/AshkenazimTrio/HG002_NA24385_son/NISTv4.2.1/GRCh38
+truth_vcf: HG002_GRCh38_1_22_v4.2.1_benchmark.vcf.gz
+truth_bed: HG002_GRCh38_1_22_v4.2.1_benchmark_noinconsistent.bed
+gtf_url: https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/gencode.v49.basic.annotation.gtf.gz
+
+calling_padding: 90          # added to CDS ±10 bp → CDS ±100 bp calling region
+min_depth: 20
+
+containers:
+  deepvariant: google/deepvariant:1.6.1
+  happy: jmcdani20/hap.py:v0.3.12
+
+low_coverage_genes: [RORA, HCRT, CRY1, DBP]

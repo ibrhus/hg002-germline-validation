@@ -1,0 +1,199 @@
+# HG002 germline exome pipeline: alignment, DeepVariant/GATK calling,
+# GIAB benchmarking on MANE Select CDS, clock/sleep panel coverage.
+configfile: "config/config.yaml"
+import os
+REPO = os.path.abspath(".")
+workdir: config["workdir"]
+
+S   = config["sample"]
+T   = config["threads"]
+REF = "ref/GRCh38.fa"
+TV  = "truth/" + config["truth_vcf"]
+TB  = "truth/" + config["truth_bed"]
+DV  = config["containers"]["deepvariant"]
+HP  = config["containers"]["happy"]
+SCR = os.path.join(REPO, "workflow/scripts")
+CHROMS = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
+DOCKER = "docker run --rm -u $(id -u):$(id -g) -v $PWD:/w"
+
+rule all:
+    input:
+        f"qc/{S}.flagstat.txt",
+        f"qc/{S}.cds_coverage.txt",
+        f"happy_v2/{S}.deepvariant_cds100.summary.csv",
+        f"happy_v2/{S}.deepvariant_cds100.per_gene.txt",
+        "qc/panel_gene_coverage.tsv",
+        "qc/exons/exon_coverage.tsv",
+        "versions.txt"
+
+rule gatk_all:
+    input: f"happy_v2/{S}.gatk_cds100.summary.csv"
+
+# ---------- downloads ----------
+rule get_reference:
+    output: fa=REF, fai=REF+".fai", dict="ref/GRCh38.dict"
+    shell:
+        "wget -q -O - {config[reference_url]} | gunzip -c > {output.fa} && "
+        "samtools faidx {output.fa} && samtools dict {output.fa} -o {output.dict}"
+
+rule bwa_index:
+    input: REF
+    output: multiext(REF, ".amb", ".ann", ".bwt", ".pac", ".sa")
+    log: "logs/bwa_index.log"
+    shell: "bwa index {input} 2> {log}"
+
+rule get_truth:
+    output: vcf=TV, tbi=TV+".tbi", bed=TB
+    shell:
+        "wget -q -c -P truth {config[truth_base_url]}/{config[truth_vcf]} "
+        "{config[truth_base_url]}/{config[truth_vcf]}.tbi {config[truth_base_url]}/{config[truth_bed]}"
+
+rule get_gtf:
+    output: "ref/gencode.v49.basic.annotation.gtf.gz"
+    shell: "wget -q -c -O {output} {config[gtf_url]}"
+
+rule get_input_bam:
+    output: temp("data/input.bam")
+    shell: "wget -q -c -O {output} {config[input_bam_url]}"
+
+# ---------- reads ----------
+rule bam_to_fastq:
+    input: "data/input.bam"
+    output: r1=temp(f"data/{S}_R1.fq.gz"), r2=temp(f"data/{S}_R2.fq.gz")
+    threads: T
+    shell:
+        "mkdir -p tmp && samtools collate -@{threads} -u -O -T tmp/col {input} | "
+        "samtools fastq -@8 -1 {output.r1} -2 {output.r2} -0 /dev/null -s /dev/null -n -F 0x900 -"
+
+rule fastqc:
+    input: f"data/{S}_R1.fq.gz", f"data/{S}_R2.fq.gz"
+    output: directory("qc/fastqc")
+    threads: 4
+    shell: "mkdir -p {output} && fastqc -t {threads} -o {output} {input}"
+
+# ---------- alignment ----------
+rule align:
+    input:
+        r1=f"data/{S}_R1.fq.gz", r2=f"data/{S}_R2.fq.gz",
+        idx=multiext(REF, ".amb", ".ann", ".bwt", ".pac", ".sa")
+    output: bam=f"bam/{S}.md.bam", bai=f"bam/{S}.md.bam.bai"
+    threads: T
+    log: bwa="logs/bwa_mem.log", md="qc/markdup_stats.txt"
+    shell:
+        "mkdir -p tmp && "
+        "bwa mem -t {threads} -R '@RG\\tID:{S}\\tSM:{S}\\tPL:ILLUMINA\\tLB:exome' "
+        "{REF} {input.r1} {input.r2} 2> {log.bwa} | "
+        "samtools fixmate -@4 -m - - | samtools sort -@8 -m 2G -T tmp/sort - | "
+        "samtools markdup -@8 -s -f {log.md} - {output.bam} && samtools index {output.bam}"
+
+rule flagstat:
+    input: f"bam/{S}.md.bam"
+    output: f"qc/{S}.flagstat.txt"
+    shell: "samtools flagstat {input} > {output}"
+
+rule mosdepth_cov20:
+    input: f"bam/{S}.md.bam"
+    output: "qc/cov20.bed"
+    params: d=config["min_depth"]
+    threads: 8
+    shell:
+        "mosdepth -t {threads} --quantize 0:{params.d}:1000000: -n qc/{S} {input} && "
+        "zcat qc/{S}.quantized.bed.gz | awk '$4==\"{params.d}:1000000\"' | cut -f1-3 > {output}"
+
+# ---------- regions ----------
+rule make_beds:
+    input: "ref/gencode.v49.basic.annotation.gtf.gz"
+    output: "beds/mane_cds10.bed", "beds/panel.bed", "beds/panel_named.bed", "beds/strat_docker.tsv"
+    shell: "bash {SCR}/make_beds.sh {input} beds"
+
+rule calling_bed:
+    input: bed="beds/mane_cds10.bed", fai=REF+".fai"
+    output: "beds/mane_cds100_calling.bed"
+    params: pad=config["calling_padding"]
+    shell: "bedtools slop -i {input.bed} -g {input.fai} -b {params.pad} | bedtools merge > {output}"
+
+rule cds_coverage:
+    input: cds="beds/mane_cds10.bed", cov="qc/cov20.bed"
+    output: f"qc/{S}.cds_coverage.txt"
+    shell:
+        "tot=$(awk '{{s+=$3-$2}} END{{print s}}' {input.cds}); "
+        "cov=$(bedtools intersect -a {input.cds} -b {input.cov} | awk '{{s+=$3-$2}} END{{print s}}'); "
+        "awk -v t=$tot -v c=$cov 'BEGIN{{printf \"MANE CDS+-10bp: %.2f Mb, >=20x: %.2f Mb (%.2f%%)\\n\", t/1e6, c/1e6, 100*c/t}}' > {output}"
+
+# ---------- DeepVariant ----------
+rule deepvariant:
+    input: bam=f"bam/{S}.md.bam", bed="beds/mane_cds100_calling.bed", fa=REF
+    output: f"vcf/{S}.deepvariant_cds100.vcf.gz"
+    threads: T
+    log: "logs/deepvariant_cds100.log"
+    shell:
+        "{DOCKER} {DV} /opt/deepvariant/bin/run_deepvariant --model_type=WES "
+        "--ref=/w/{input.fa} --reads=/w/{input.bam} --regions=/w/{input.bed} "
+        "--output_vcf=/w/{output} --intermediate_results_dir=/w/tmp/dv_cds100 "
+        "--num_shards={threads} > {log} 2>&1 && rm -rf tmp/dv_cds100"
+
+# ---------- GATK (optional: snakemake gatk_all) ----------
+rule gatk_split_bed:
+    input: "beds/mane_cds100_calling.bed"
+    output: temp("tmp/gatk/{chrom}.bed")
+    shell: "grep -P '^{wildcards.chrom}\\t' {input} > {output} || true"
+
+rule gatk_hc:
+    input: bam=f"bam/{S}.md.bam", bed="tmp/gatk/{chrom}.bed", fa=REF, d="ref/GRCh38.dict"
+    output: temp("tmp/gatk/{chrom}.vcf.gz")
+    log: "logs/gatk/{chrom}.log"
+    shell:
+        "if [ -s {input.bed} ]; then gatk --java-options -Xmx4g HaplotypeCaller "
+        "-R {input.fa} -I {input.bam} -L {input.bed} -O {output} 2> {log}; "
+        "else bcftools view -h {TV} | bcftools view -Oz -o {output} - ; fi"
+
+rule gatk_merge_filter:
+    input: expand("tmp/gatk/{chrom}.vcf.gz", chrom=CHROMS)
+    output: f"vcf/{S}.gatk_cds100.vcf.gz"
+    params: raw=f"tmp/gatk/{S}.raw.vcf.gz"
+    shell:
+        "bcftools concat {input} -Oz -o {params.raw} && tabix -f -p vcf {params.raw} && "
+        "gatk VariantFiltration -R {REF} -V {params.raw} "
+        "--filter-expression 'QD < 2.0 || FS > 60.0 || MQ < 40.0' --filter-name hardFilter -O {output}"
+
+# ---------- benchmarking ----------
+rule happy:
+    input: vcf="vcf/{s}.{caller}.vcf.gz", tv=TV, tb=TB, cds="beds/mane_cds10.bed",
+           strat="beds/strat_docker.tsv", fa=REF
+    output: "happy_v2/{s}.{caller}.summary.csv", "happy_v2/{s}.{caller}.extended.csv"
+    threads: 16
+    log: "logs/happy_{s}.{caller}.log"
+    shell:
+        "{DOCKER} {HP} /opt/hap.py/bin/hap.py /w/{input.tv} /w/{input.vcf} "
+        "-f /w/{input.tb} -T /w/{input.cds} --stratification /w/{input.strat} "
+        "-r /w/{input.fa} -o /w/happy_v2/{wildcards.s}.{wildcards.caller} "
+        "--pass-only --threads {threads} > {log} 2>&1"
+
+rule per_gene:
+    input: "happy_v2/{s}.{caller}.extended.csv"
+    output: "happy_v2/{s}.{caller}.per_gene.txt"
+    shell:
+        """awk -F, 'NR==1{{for(i=1;i<=NF;i++) h[$i]=i; next}}
+          $h["Subtype"]=="*" && $h["Filter"]=="PASS" && $h["Genotype"]=="*" && $h["Subset"]!="*" {{
+            printf "%-12s %-6s truth=%-5s TP=%-5s FN=%-4s FP=%-4s recall=%s precision=%s\\n",
+              $h["Subset"], $h["Type"], $h["TRUTH.TOTAL"], $h["TRUTH.TP"], $h["TRUTH.FN"],
+              $h["QUERY.FP"], $h["METRIC.Recall"], $h["METRIC.Precision"] }}' {input} | sort > {output}"""
+
+# ---------- coverage reports ----------
+rule gene_coverage:
+    input: bam=f"bam/{S}.md.bam", bed="beds/panel_named.bed"
+    output: "qc/panel_gene_coverage.tsv"
+    shell: "bash {SCR}/gene_coverage.sh > /dev/null"
+
+rule exon_coverage:
+    input: bam=f"bam/{S}.md.bam", gtf="ref/gencode.v49.basic.annotation.gtf.gz", fa=REF
+    output: "qc/exons/exon_coverage.tsv"
+    params: genes=" ".join(config["low_coverage_genes"])
+    shell: "bash {SCR}/exon_coverage.sh {params.genes} > /dev/null"
+
+rule versions:
+    output: "versions.txt"
+    shell:
+        "set +o pipefail; ( samtools --version | head -1; bwa 2>&1 | grep Version; "
+        "gatk --version 2>/dev/null | grep 'GATK)'; mosdepth --version; bedtools --version; "
+        "bcftools --version | head -1; echo DeepVariant {DV}; echo hap.py {HP} ) > {output} || true"

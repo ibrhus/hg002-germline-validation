@@ -1,0 +1,12 @@
+name: ngs
+channels: [conda-forge, bioconda]
+dependencies:
+  - samtools=1.24
+  - bwa=0.7.19
+  - gatk4=4.6.2.0
+  - mosdepth
+  - bedtools
+  - bcftools
+  - htslib
+  - fastqc
+  - multiqc
